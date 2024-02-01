@@ -1,0 +1,920 @@
+---
+title: "Timeseries"
+author: "DM"
+date: "2023-11-07"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_collapsed: yes
+  pdf_document:
+    toc: yes
+---
+
+Использовалась библиотека **stats**
+
+# Библиотеки
+
+```{r, warning=FALSE, message=FALSE}
+library(Rssa)
+library(ggplot2)
+library(mFilter)
+data(USUnemployment)
+```
+
+# Периодограммы
+
+*к 14.03*
+
+## Эффект растекания синуса
+
+**Растекание** --- эффект, возникаемый, если длинна ряда не будет кратна периоду. Найдем длинну нашего ряда:
+
+```{r, warning=FALSE, message=FALSE}
+w <- 0.1  # Тут задаем частоту, которая соответствует периоду T = 10
+x <- 1:100
+y <- sin(2 * pi * w * x)
+length(y)
+```
+
+Получаем длинну ряда 100, построим периодограмму для ряда у которого длинна кратна периоду:
+
+```{r, warning=FALSE, message=FALSE}
+sp <- spec.pgram(y, spans = NULL, detrend = FALSE, log = "no", fast = FALSE, taper = 0)
+```
+
+Видим, что эффекта растекания на периодограмме нет, пик единственный и соответсвует заданной частоте. Теперь попробуем изменить длинну исходного ряда. Можно добавить несколько нулевых наблюдений в ряд, но лучше убрать уже имеющиеся, чтобы не искажать картину нулями:
+
+```{r, warning=FALSE, message=FALSE}
+yCut <- y[1:(length(y) - 3)] # Убираем три наблюдения
+length(yCut)
+```
+
+Теперь длинна ряда 97, что не кратно периоду T = 10, теперь посмотрим на его периодограмму:
+
+```{r, warning=FALSE, message=FALSE}
+sp <- spec.pgram(yCut, log = "no", detrend = FALSE, fast = FALSE, taper = 0)
+```
+
+Видим, что пик начал расползаться по соседним частотам.
+
+## Генерация белого шума
+
+**Шум** --- это случайная составляющая временного ряда. Если средний вклад всех частот одинаковый, то шум называется белым. Свойство периодограммы белого шума: значение периодограммы имеет экспоненциальное распределение с одним и тем же средним.
+
+```{r, warning=FALSE, message=FALSE}
+n <- 1000
+wnoise <- rnorm(n, 0, 1)
+spec.pgram(wnoise, detrend = FALSE, log = "no", fast = FALSE, pad = FALSE,taper = 0)
+```
+
+Так как для шума вообще нет детерминирующих частот, мы видим из периодограммы, что каждая частота входит примерно с одинаковой силой. С увеличением количества наблюдений будет увеличиваться значение каждой частоты на сетке:
+
+```{r}
+nLarge <- 10000
+wnoiseLarge <- rnorm(nLarge, 0, 1)
+spec.pgram(wnoiseLarge, detrend = FALSE, log = "no",fast = FALSE, pad = FALSE, taper = 0)
+```
+
+## Генерация красного шума
+
+Отличие красного шума от белого в том, что предыдущие значения влияют на следующие, т.е. имеют ненулевую корреляцию, в отличие от белого шума.
+
+$r_n = cor \cdot r_{n-1}+\sqrt{(1-cor^2)} \cdot \omega$
+
+```{r}
+w0 <- wnoise[1]
+wnoise <- wnoise[2:n]
+cor <- 0.8
+rnoise = Reduce(function(prev_v, next_v) cor * prev_v + next_v * sqrt(1 - cor^2), wnoise, w0, accumulate = T)
+
+spec.pgram(rnoise, detrend = FALSE, log = "no",fast = FALSE, pad = FALSE,taper = 0)
+```
+
+## Построение периодограммы для реальных данных
+
+### График безработицы в США {#график-безработицы-в-сша}
+
+О данных: <https://link.springer.com/chapter/10.1007/978-1-4612-5098-2_66> 408 ежемесячных наблюдений безработицы в США среди мужчин Длину окна берем равную 12 в соотвествии с годовой периодичностью. Посмотрим на их график:
+
+```{r}
+library(Rssa)
+data(USUnemployment)
+
+unempl.male <- USUnemployment[, "MALE"]
+
+plot(unempl.male, type = "l")
+```
+
+### Периодограмма безработицы в США {#периодограмма-безработицы-в-сша}
+
+По графику можно сказать, что временной ряд достаточно волатильный, имеет сложный тренд, по периодограмме можно сделать выводы о частотах входящих в него:
+
+```{r}
+spec.pgram(unempl.male, detrend = FALSE, log = "no",fast = FALSE, pad = FALSE,taper = 0)
+```
+
+Видим, что наибольший вклад имеют низкие частоты, которые мы относим к шуму, также есть пики в точках w = 1/12 и w = 2/12, что говорит нам о наличии годовой и полугодовой сезонности.
+
+# Фильтры
+
+*к 14.03*
+
+## Функция для фильтра скользящего среднего
+
+```{r}
+movingAverage <- function(x, n=1, centered=TRUE) {
+      
+      if (centered) {
+            before <- floor  ((n-1)/2)
+            after  <- ceiling((n-1)/2)
+      } else {
+            before <- n-1
+            after  <- 0
+      }
+
+      s     <- rep(0, length(x))
+      count <- rep(0, length(x))
+      
+      new <- x
+      count <- count + !is.na(new)
+      new[is.na(new)] <- 0
+      s <- s + new
+
+      i <- 1
+      while (i <= before) {
+            new   <- c(rep(NA, i), x[1:(length(x)-i)])
+            
+            count <- count + !is.na(new)
+            new[is.na(new)] <- 0
+            s <- s + new
+            
+            i <- i+1
+      }
+      
+      i <- 1
+      while (i <= after) {
+            new   <- c(x[(i+1):length(x)], rep(NA, i))
+            
+            count <- count + !is.na(new)
+            new[is.na(new)] <- 0
+            s <- s + new
+            
+            i <- i+1
+      }
+      s/count
+}
+```
+
+## АЧХ
+
+```{r}
+afc <- function(filter, omega)
+{
+      k <- seq_along(filter) - 1
+      h <- function(o) sum(rev(filter)*exp(-k*1i*o))
+      abs(sapply(omega, h))
+}
+```
+
+## Применение фильтра скользящего среднего к модельным данным {#применение-фильтра-скользящего-среднего-к-модельным-данным}
+
+#### Задаем модель
+
+```{r}
+n = 100
+x <- 1:n
+period <- 10
+
+modelTs <- (2*x + 3) +
+ 5*cos(2*pi*(1/period)*x) + 5*cos(2*pi*(2/period)*x) + 5*cos(2*pi*(3/period)*x) + 5*cos(2*pi*(4/period)*x) +
+  + rnorm(n)
+
+plot(modelTs, type = "l",  main = "Исходный временной ряд")
+```
+
+#### Исходная периодограмма
+
+```{r}
+sp <- spec.pgram(modelTs, detrend = FALSE, log = "no", fast = FALSE, pad = FALSE, taper = 0)
+```
+
+#### Применяем фильтр
+
+```{r}
+plot(modelTs, main = "Исходный ряд + Cкользящее среднее", type = "l")
+legend(x = "topleft",                                # Position
+       legend = c("timeseries", "MA(5)", "MA(10)"),  # Legend texts
+       lty = c(1, 1, 1),                             # Line types
+       col = c("black", "red", "blue"),              # Line colors
+       lwd = 2)                                      # Line width
+
+maHalf <- movingAverage(modelTs, 5, TRUE)
+lines(maHalf, col = "red")
+
+maFull <- movingAverage(modelTs, 10, TRUE)
+lines(maFull, col = "blue")
+```
+
+## Периодограмма MA(5)
+
+```{r}
+sp <- spec.pgram(maHalf ,detrend = FALSE, log = "no",fast = FALSE, pad = FALSE,taper = 0)
+sp <- spec.pgram(maHalf ,detrend = FALSE, log = "yes",fast = FALSE, pad = FALSE,taper = 0)
+```
+
+## Периодограмма MA(10)
+
+```{r}
+sp <- spec.pgram(maFull ,detrend = FALSE, log = "no",fast = FALSE, pad = FALSE,taper = 0)
+sp <- spec.pgram(maFull ,detrend = FALSE, log = "yes",fast = FALSE, pad = FALSE,taper = 0)
+```
+
+## АЧХ фильтра скользящего среднего
+
+```{r}
+freq <- seq(0, pi, 0.001)
+filt <- rep(1/period, period)
+omega <- freq/2/pi
+
+str <- c("0", "1/10", "2/10", "3/10", "4/10","5/10")
+plot(afc(filt, freq) ~ omega, type = "l", xlab = "Frequency", ylab = "Frequency response", xaxt = "n")
+title(main = "АЧХ фильтра скользящего среднего MA(10)")
+axis(1, at = seq(0, 0.5, by = 1/10), las = 2, labels = sprintf("%s", str))
+
+period = 5
+filt <- rep(1/period, period)
+
+plot(afc(filt, freq) ~ omega, type = "l", xlab = "Frequency", ylab = "Frequency response")
+title(main = "АЧХ фильтра скользящего среднего MA(5)")
+```
+
+#### Применение фильтра к реальным данным
+
+[График безработицы в США](#график-безработицы-в-сша) [Периодограмма безработицы в США](#периодограмма-безработицы-в-сша)
+
+Для выделения тренда выставим длинну окна равную периоду ряда (T = 12). Наложим график скользящего среднего на исходный:
+
+```{r}
+plot(unempl.male, main = "Исходный ряд + Cкользящее среднее", type = "l")
+legend(x = "topleft",                                
+       legend = c("timeseries", "MA(12)", "MA(24)"),
+       lty = c(1, 1, 1, 1),                           
+       col = c("black", "blue", "red"),    
+       lwd = 2)                                     
+
+ma12 <- movingAverage(unempl.male, 12, TRUE)
+ma24 <- movingAverage(unempl.male, 24, TRUE)
+lines(ma12, col = "blue")
+lines(ma24, col = "red")
+```
+
+Теперь построим периодограмму скользящего среднего:
+
+```{r}
+spec.pgram(ma12, detrend = FALSE, log = "no",fast = FALSE, pad = FALSE,taper = 0)
+```
+
+# SSA
+
+*к 14.03*
+
+## Выделение тренда с помощью SSA
+
+Применим SSA к реальным данным, ширину окна можно взять L = K/2 и кратную периоду (условие ассимптотической разделимости). Построим матрицу взвешенных корреляций, чтобы проанализировать компоненты:
+
+## Матрица взвешенных корреляций
+
+```{r}
+tsSSA <- ssa(unempl.male, L = length(unempl.male) %/% 2)
+tsSSACor <- wcor(tsSSA, groups = 1:30)
+plot(tsSSACor)
+```
+
+Видим, что после 4 компоненты начинается зашумленность, при этом 15-я компонента достаточно хорошо отделяется от соседних.
+
+## Собственные вектора
+
+```{r}
+plot(tsSSA, type="vectors", idx = 1:20)
+```
+
+По парам собственных векторов можно сказать о векторах периодичностей:
+
+```{r}
+plot(tsSSA, type="paired", idx = 2:20)
+```
+
+Видим правильные фигуры в компонентах (5, 6) и (12, 13):
+
+```{r}
+tsSSASeason <- reconstruct(tsSSA, groups = list(season = c(5, 6, 12, 13)))
+spec.pgram(tsSSASeason$season, log = 'no', fast = FALSE, taper = 0, detrend = FALSE)
+```
+
+Видим, что выделились пики соответсвующие годовой и полугодовой периодичности, как на [исходной периодограмме](#периодограмма-безработицы-в-сша).
+
+```{r}
+tsSSASignal <- reconstruct(tsSSA, groups = list(c(1:4, 7:10), c(5, 6, 12, 13)))
+
+plot(tsSSASignal, add.residuals = TRUE, add.original = TRUE, plot.method = "xyplot", superpose = TRUE, auto.key = list(columns = 2))
+```
+
+# FOSSA
+
+Алгоритм улучшает сильную разделимость.
+
+## FOSSA: матрица корреляций
+
+```{r}
+tsFOSSA <- fossa(tsSSA, nested.groups = c(1:13))
+tsFOSSACor <- wcor(tsFOSSA, groups = 1:30)
+
+plot(tsFOSSACor)
+```
+
+## FOSSA: собственные вектора
+
+```{r}
+plot(tsFOSSA, type = "vectors", idx=1:15)
+```
+
+## FOSSA: итоговое разложение
+
+```{r}
+tsFOSSASignal = reconstruct(tsFOSSA, groups <- list(c(5:13), 1:4))
+
+plot(tsFOSSASignal, add.residuals = TRUE, add.original = TRUE, plot.method = "xyplot", superpose = TRUE, auto.key = list(columns = 2))
+```
+
+## Корреляции SSA vs. FOSSA
+
+```{r}
+plot(tsSSACor)
+plot(tsFOSSACor)
+```
+
+## Сезонности SSA vs. FOSSA
+
+```{r}
+matplot(data.frame(tsSSASignal$F2, tsFOSSASignal$F2), type = 'l', col=c("red","green"), lty=c(1,1))
+```
+
+## Тренд SSA vs. FOSSA
+
+```{r}
+matplot(data.frame(c(unempl.male), tsSSASignal$F1, tsFOSSASignal$F1), type = 'l', col=c("black", "red","green"), lty=c(1,1))
+```
+
+# Различные способы выделения тренда
+
+*к 21.03, 28.03*
+
+### Тренд по POLY
+
+```{r}
+trend.poly3 = lm(unempl.male ~ poly(1:408, degree = 3))
+trend.poly5 = lm(unempl.male ~ poly(1:408, degree = 5))
+trend.poly7 = lm(unempl.male ~ poly(1:408, degree = 7))
+
+
+plot(c(unempl.male), main = "Исходный ряд + POLY", type = "l")
+legend(x = "topleft",                                
+       legend = c("timeseries", "POLY(3)", "POLY(5)", "POLY(7)"),
+       lty = c(1, 1, 1, 1),                           
+       col = c("black", "red", "blue", "green"),    
+       lwd = 2)    
+
+lines(trend.poly3$fitted.values, col="red", type = "l")
+lines(trend.poly5$fitted.values, col="blue", type = "l")
+lines(trend.poly7$fitted.values, col="green", type = "l")
+```
+
+### Тренд по LOESS
+
+LOESS метод основан на сглаживании с помощью построения локальных взвешенных линейных регрессий
+
+```{r}
+index <- 1:408
+
+fit.loess <- loess(unempl.male ~ index, span = 0.2, degree = 1)      
+trend.loess <- predict(fit.loess)
+
+plot(c(unempl.male), main = "Исходный ряд + LOESS", type = "l")
+legend(x = "topleft",                                
+       legend = c("timeseries", "LOESS"),
+       lty = c(1, 1, 1, 1),                           
+       col = c("black", "blue"),    
+       lwd = 2)                                     
+lines(trend.loess, col = "blue", type = "l")
+```
+
+### Тренд по HP
+
+```{r}
+chest = hpfilter(unempl.male, freq=60000, type="lambda")
+trend.hp = chest$trend
+plot(unempl.male, type="l")
+lines(trend.hp, col="red")
+legend("topleft", legend = c("Real TS","HP"), col = c("black","red"), lty=1)
+```
+
+# Итоговый график со всеми способами выделения тренда
+
+```{r}
+plot(unempl.male, type="l")
+lines(trend.hp, col="red")
+lines(ma24, col="blue")
+lines(ts(trend.loess, start=c(1948, 1), frequency=12), col="orange")
+lines(ts(trend.poly7$fitted.values, start=c(1948, 1), frequency=12), col="green")
+legend("topleft", legend = c("Real TS","HP", "MA(24)", "LOESS", "POLY(5)"), col = c("black","red", "blue", "orange", "green"), lty=1)
+```
+
+# Сравнение методов разложения
+
+*04.04*
+
+## STL
+
+STL имеет следующие параметры:
+
+-   (inner) -- число итераций внутреннего цикла (р).
+
+-   (outer) -- число итераций внешнего цикла. У нас в данных нет аутлаеров, поэтому outer = 0
+
+-   (l.window) -- сглаживающий параметр для low-pass фильтра. Возьмем равным 13. Рекомендуют брать ближайший нечетный к периоду.
+
+-   (t.window) -- сглаживающий параметр для тренда. Рекомендуют брать ближайшим нечетным к (1.5\*period) / (1-(1.5/s.window)). Равен 23.
+
+ns - (s.window) -- сглаживающий параметр сезонности. Берем 13, так как годовая периодичность и параметр должен быть нечетным
+
+```{r}
+tsSTL <- stl(unempl.male, s.window = 13, l.window = 13, outer = 0, inner = 1, t.window = 23)
+plot(tsSTL)
+```
+
+## Classical seasonal decomposition
+
+```{r}
+tsCSD <- ssa(unempl.male, L = length(unempl.male) %/% 2, force.decompose =  FALSE, svd.method = "nutrlan")
+fit.dec <- decompose(tsCSD, neig = 40)
+tsCSDCor <- wcor(fit.dec, groups= 1:40)
+plot(tsCSDCor)
+
+plot(fit.dec, type = "vectors", idx = 1:20)
+tsCSDSignal <- reconstruct(fit.dec, groups = list(trend = c(1:4, 7:10, 15), season = c(5, 6, 12, 13)))
+plot(tsCSDSignal)
+```
+
+# Итоговый график трендов разных разложений
+
+```{r}
+plot(unempl.male, type="l")
+lines(tsSSASignal$F1, col="red")
+lines(tsFOSSASignal$F1, col="blue")
+lines(tsCSDSignal$trend, col="orange")
+lines(ts(data.frame(tsSTL$time.series)$trend, start=c(1948, 1), frequency = 12), col="green")
+legend("topleft", legend = c("Real TS","SSA", "FOSSA", "CSD", "STL"), col = c("black","red", "blue", "orange", "green"), lty=1)
+```
+
+# Примеры применения Toeplitz SSA и SSA with projections
+
+## SSA with projections
+
+Projection SSA применяется для улучшения разделимости линейного тренда и сезонности. Используем смоделированные данные с линейным трендом ([Применение фильтра скользящего среднего к модельным данным](#применение-фильтра-скользящего-среднего-к-модельным-данным)):
+
+```{r}
+x <- 1:100
+modelTs <- (2*x + 3) +
+ + 5*cos(2*pi*(1/25)*x) + cos(2*pi*(1/5)*x) + rnorm(50)
+
+plot(modelTs, type="l")
+
+# Применим SSA с двойным центрированием для лучшего отделения линейного тренда
+modelTsSSA <- ssa(modelTs, L = 25, column.projector='centering', row.projector='centering')
+plot(modelTsSSA, type = "vectors")
+plot(modelTsSSA, type = "paired")
+
+modelTsSSASignal <- reconstruct(modelTsSSA, groups = list(1:2))
+
+plot(modelTs, type = "l")
+lines(modelTsSSASignal$F1, col = "red")
+```
+
+## Toeplitz SSA
+Теплицев SSA применяется как улучшение basic-SSA для стационарных рядов.
+
+```{r}
+x <- 1:100
+modelTs <- 5*cos(2*pi*(1/25)*x) + 2*cos(2*pi*(1/5)*x) + rnorm(50)
+
+plot(modelTs, type="l")
+modelTsSSA <- ssa(modelTs, kind = "toeplitz-ssa")
+
+plot(modelTsSSA, type = "vectors")
+plot(modelTsSSA, type = "paired")
+
+modelTsSSASignal <- reconstruct(modelTsSSA, groups = list(1:4))
+
+plot(modelTsSSASignal, add.residuals = TRUE, add.original = TRUE, plot.method = "xyplot", superpose = TRUE, auto.key = list(columns = 2))
+
+plot(modelTs, type = "l")
+lines(modelTsSSASignal$F1, col = "red")
+```
+
+# Прогнозы: рекурентный и векторный
+
+*02.05*
+
+## Рекурентный прогноз - rforecast
+
+```{r}
+forcastR <- rforecast(tsSSA, groups = list(trend = c(1:4, 7:10), season = c(5, 6, 12, 13)), len = 12, only.new = F)
+
+plot(unempl.male, type="l")
+lines(data.frame(forcastR)$trend, col="red")
+legend("topleft", legend = c("Real TS","RForcast trend"), col = c("black","red"), lty=1)
+```
+
+## C отсечением периода
+
+Применяем SSA к ряду с отсеченным периодом
+
+```{r}
+tsCut = ts(unempl.male[1:(length(unempl.male)-12)], start=c(1948, 1), frequency=12)
+
+tsCutSSA <- ssa(tsCut,  L = length(tsCut) %/% 2)
+plot(wcor(tsCutSSA, groups = 1:30))
+plot(wcor(tsCutSSA, groups = 1:15))
+plot(tsCutSSA, type="vectors", idx = 1:20)
+
+tsCutSSASignal = reconstruct(tsCutSSA, groups <- list(c(1:3, 6:10, 14:15), c(4,5,12,13)))
+
+plot(tsCutSSASignal, add.residuals = TRUE, add.original = TRUE, plot.method = "xyplot", superpose = TRUE, auto.key = list(columns = 2))
+```
+
+```{r}
+forcastRCut <- rforecast(tsCutSSA, groups = list(trend = c(1:3, 6:10, 14:15), season = c(4,5,12,13)), len = 12, only.new = F)
+plot(c(tsCut), type="l")
+lines(c(data.frame(forcastRCut)$trend), col="red")
+lines(c(data.frame(forcastR)$trend), col="blue")
+legend("topleft", legend = c("Cut TS","RForcast cut trend", "RForcast full trend"), col = c("black","red", "blue"), lty=1)
+```
+
+## Векторный прогноз - vforecast
+
+```{r}
+forcastV <- vforecast(tsSSA, groups = list(trend = c(1:4, 7:10), season = c(5, 6, 12, 13)), len = 12, only.new = F)
+
+plot(cbind(unempl.male, forcastV$trend), plot.type = "single", 
+     col = c("black", "red"), ylab = NULL)
+
+legend("topleft", legend = c("Real TS","VForcast full trend"), col = c("black","red"), lty=1)
+```
+
+## C отсечением периода
+
+```{r}
+forcastVCut <- vforecast(tsCutSSA, groups = list(trend = c(1:3, 6:10, 14:15), season = c(4,5,12,13)), len = 12, only.new = F)
+
+
+plot(c(tsCut), type="l")
+lines(c(data.frame(forcastVCut)$trend), col="red")
+lines(c(data.frame(forcastV)$trend), col="blue")
+legend("topleft", legend = c("Real TS","VForcast cut trend", "VForcast full trend"), col = c("black","red", "blue"), lty=1)
+```
+
+## Восстановление ряда по ЛРФ
+
+*25.04/02.05*
+
+### Ряд 1: Экспонента
+
+```{r, warning=FALSE, message=FALSE}
+library(Matrix)
+```
+
+Находим ранг матрицы для экспоненциального ряда:
+
+```{r, warning=FALSE, message=FALSE}
+N = 10
+LRF = 3.1^(1:N)
+rankMatrix(hankel(LRF))[1]
+```
+
+Ожидаемо, он равен одному. Далее находим сигнальные корни ряда:
+
+```{r, warning=FALSE, message=FALSE}
+LRF.ssa = ssa(LRF, L=2, method = "svd")
+l = lrr(LRF.ssa, groups = list(1))
+plot(l)
+```
+
+```{r, warning=FALSE, message=FALSE}
+roots_my = roots(l)
+K = length(roots_my)
+S_n = LRF[1:K]
+lin_sys = data.frame(S_n)
+vars = matrix(nrow = K, ncol = K)
+for(i in 1:K){
+  vars[i]=roots_my[i]^(1:K)
+}
+lm0 = lm(formula = S_n ~ 0 + ., data = data.frame(vars))
+print(lm0)
+```
+
+Находим значения по линейной рекурентной формуле:
+
+```{r}
+pred_S_n = lm0$coefficients[[1]]*(roots_my[1]^(1:N))
+
+print(LRF)
+```
+
+```{r, warning=FALSE, message=FALSE}
+S_n = LRF[1:N]
+lin_sys = data.frame(S_n)
+vars = matrix(nrow = N, ncol = K)
+for(i in 1:K){
+  vars[i]=roots_my[i]^(1:N)
+}
+```
+
+```{r, warning=FALSE, message=FALSE}
+lm0 = lm(formula = S_n ~ 0 + ., data = data.frame(vars))
+print(lm0)
+```
+
+Сравниваем исходный ряд с полученным
+
+```{r}
+pred_S_n = lm0$coefficients[[1]]*(roots_my[1]^(1:N))
+
+print(LRF)
+print(pred_S_n)
+```
+
+### Ряд 2: Линейная функция
+
+```{r, warning=FALSE, message=FALSE}
+N = 10
+
+LRF = 2*(1:N)+5
+```
+
+Находим ранг матрицы:
+
+```{r}
+rankMatrix(hankel(LRF))[1]
+```
+
+Линейная функция задается двумя компонентами.
+
+```{r}
+LRF.ssa = ssa(LRF, L=3, method = "svd")
+l <- lrr(LRF.ssa, groups = list(1:2))
+roots_my <- roots(l)
+print(l)
+print(roots_my)
+```
+
+Получаем два комплексно-сопряженных корня
+
+```{r}
+print(2 * pi / Arg(roots_my))
+print(Mod(roots_my))
+roots_my2 <- rep(Re(mean(roots_my)), length(roots_my))
+print(roots_my2)
+```
+
+Находим коэффиценты исходного ряда
+
+```{r}
+m = length(roots_my2)
+s_n = LRF[1:N]
+vars <- matrix(nrow = N, ncol = m)
+for (i in 1:m) {
+  vars[ ,i] <- (1:N) ^ (i-1) * roots_my2 ^ (1:N)
+}
+
+lm0 <- lm(s_n ~ 0 + ., data = data.frame(vars))
+print(lm0)
+```
+
+Сравниваем исходный ряд с полученным
+
+```{r}
+pred_S_n = lm0$coefficients[[1]][1] * (vars[,1]) + lm0$coefficients[[2]][1] * (vars[,2])
+print(LRF)
+print(pred_S_n)
+```
+
+# Восстановление ЛРФ реального временного ряда
+
+Проанализируем собственные числа ряда
+
+```{r}
+tsSSA$sigma
+
+plot(tsSSA$sigma, type="l")
+```
+
+Видим 13 "ненулевых" собственных числа.
+
+```{r}
+rk = 13
+
+par = parestimate(tsSSA, groups = list(1:rk), method = "esprit")
+
+modulusReal = par$moduli
+periodsReal = par$periods
+o = order(abs(periodsReal), decreasing = TRUE)
+r0 = reconstruct(tsSSA, groups = list(signal = 1:rk))$signal
+
+
+len <- rk
+vars <- matrix(nrow = len, ncol = rk)
+
+for (i in 1:rk) {
+  if (periodsReal[i] == Inf)
+    vars[, i] <- modulusReal[i]^(1:len)
+  else if (periodsReal[i] == 2)
+    vars[, i] <- (-modulusReal[i])^(1:len)
+  else if (periodsReal[i] > 0)
+    vars[, i] <- 
+      modulusReal[i]^(1:len) * sin(2 * pi * (1:len) / periodsReal[i])
+  else
+    vars[, i] <- 
+      modulusReal[i]^(1:len) * cos(2 * pi * (1:len) / periodsReal[i])
+}
+lm0 <- lm(r0[1:len] ~ 0 + ., data = data.frame(vars))
+coefs0 <- coef(lm0)
+print(round(coefs0), digits = rk)
+```
+
+```{r}
+idx <- seq(1, rk)
+coefs.c.phase <- numeric(length(idx))
+phases.c <- numeric(length(idx))
+periods.c.phase <- numeric(length(idx))
+moduli.c.phase <- numeric(length(idx))
+for (i in seq_along(idx)) {
+  
+  periods.c.phase[i] <- periodsReal[idx[i]]
+  moduli.c.phase[i] <- modulusReal[idx[i]]
+  coefs.c.phase[i] <- coefs0[idx[i]]
+  phases.c[i] <- atan2(coefs0[idx[i] + 1], coefs0[idx[i]])
+  if(i == rk){
+    phases.c[i] <- atan2(coefs0[idx[i]], coefs0[idx[i]])
+  }
+}
+
+s = data.frame(periods = periods.c.phase, phases = phases.c, 
+                 coefficients = coefs.c.phase, 
+                 moduli =moduli.c.phase)
+print(s)
+```
+
+# ARIMA
+
+## Автоковариационная функция ACF
+
+```{r}
+ts1 <- read.csv(file = "ts1.txt", header = TRUE, as.is = FALSE)
+ts5 <- read.csv(file = "ts5.txt", header = TRUE, as.is = FALSE)
+
+plot(ts1$x,  type = "l")
+plot(ts5$x,  type = "l")
+
+acf(ts1, main = "Функция для данных ts1")
+acf(ts5, main = "Функция для данных ts5")
+```
+
+## Функция PACF
+
+По количеству столбцов, значимо отличающихся от нуля, можно определить количество параметров в авторегрессии.
+
+```{r}
+pacf(ts1, main = "Функция для данных ts1")
+pacf(ts5, main = "Функция для данных ts5")
+```
+
+## Оценка параметров модели
+
+```{r}
+fit1 <- auto.arima(ts1)
+fit5 <- auto.arima(ts5)
+
+
+fit1
+fit5
+
+forecastedValues1 <- forecast(fit1, 20)
+forecastedValues5 <- forecast(fit5, 40)
+
+plot(forecastedValues1, main = "Graph with forecasting FIT1",
+col.main = "darkgreen") 
+
+
+plot(forecastedValues5, main = "Graph with forecasting FIT5",
+col.main = "darkgreen") 
+  
+```
+
+# ARIMA на реальных данных + (ARIMA VS SSA VS ETS)
+
+```{r}
+fitArima <- auto.arima(unempl.male)
+checkresiduals(fitArima)
+
+summary(fitArima)
+
+fitArimaForecast <- forecast(fitArima, h = 24)
+autoplot(fitArimaForecast)
+
+tsSSABforecast <- bforecast(tsSSA, groups = list(c(1:4, 7:10)), len = 24, R = 50, only.new = F)
+
+
+tsSSAETS <- hw(ts(unempl.male[1:(length(unempl.male)-24)], start=c(1948, 1), frequency=12), seasonal="multiplicative", h = 24)
+
+autoplot(tsSSABforecast)
+
+plot(tsSSAETS)
+```
+
+# RMSE SSA vs ARIMA vs ETS
+```{r}
+sd(unempl.male)
+
+tsTest = tail(unempl.male, 24)
+
+tsSSABforecast <- bforecast(tsSSA, groups = list(c(1:4, 7:10)), len = 24, R = 50, only.new = T)
+
+mseSSA = mean((data.frame(tsSSABforecast)$Value - c(tsTest))**2)
+
+mseARIMA = mean((c(fitArimaForecast$mean) - c(tsTest))**2)
+
+mseETS = mean((c(tsSSAETS$mean) - c(tsTest))**2)
+```
+
+## RMSE SSA
+
+```{r}
+print(sqrt(mseSSA))
+```
+
+## RMSE ARIMA
+```{r}
+print(sqrt(mseARIMA))
+```
+
+## RMSE ETS
+```{r}
+print(sqrt(mseETS))
+```
+
+
+# SSA и разладка
+```{r}
+library(Rssa)
+library("lattice")
+firstHalf = c(10*sin(2*pi*(1:72)/6))
+secondHalf = c(30*sin(2*pi*(73:144)/6))
+tsdestruct = c(firstHalf,secondHalf)
+plot(tsdestruct, type = "l", col = "red")
+```
+
+```{r}
+s <- ssa(tsdestruct, L = 12)
+w <- wcor(s, groups = 1:10)
+plot(w)
+```
+
+```{r}
+plot(s, type = "vectors", idx=1:10)
+```
+
+```{r}
+r <- reconstruct(s, groups = list(Trend = c(1)))
+
+tsdestruct_res <- residuals(r)
+N <- length(tsdestruct_res)
+rank <- 2
+periods <- function(M, L) {
+  ts(sapply(1:(N - M),
+            function (i) {
+              s <- ssa(tsdestruct_res[i:(i + M - 1)], L = L)
+              par <- parestimate(s, groups = list(c(1:rank)), 
+                                 method = "esprit")
+              abs(par$periods[1])
+            }),
+     start = time(tsdestruct)[M + 1], delta = 1)
+}
+per12 <- periods(12, 6)
+per24 <- periods(24, 12)
+lattice::xyplot(plot.method = "xyplot",per12, type = "l")
+
+M <- 12; L <- M / 2
+hm <- hmatr(tsdestruct_res, B = M, T = M, L = L, neig = rank)
+plot(hm)
+```
